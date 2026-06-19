@@ -1,0 +1,10 @@
+# Byte-compiled / optimized files
+__pycache__/
+*.py[cod]
+
+# Test / coverage caches
+.pytest_cache/
+.coverage
+
+# OS noise
+.DS_Store
