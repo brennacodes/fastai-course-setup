@@ -566,6 +566,101 @@ class SnapshotTests(unittest.TestCase):
             self.assertFalse(course_setup.snapshot(repo_root=directory, once=True))
 
 
+class MirrorTests(unittest.TestCase):
+    """The Mac-side notebook-to-Drive mirror (mirror_notebooks)."""
+
+    @contextmanager
+    def _temp_repo(self):
+        with tempfile.TemporaryDirectory() as directory:
+            subprocess.run(["git", "-C", directory, "init", "-q"], check=True)
+            yield Path(directory)
+
+    def test_copies_a_notebook_into_drive(self):
+        with self._temp_repo() as root, temp_drive() as drive:
+            (root / "demo.ipynb").write_text('{"cells": []}')
+            copied = course_setup.mirror_notebooks(repo_root=root, once=True)
+            self.assertEqual(copied, 1)
+            mirrored = drive / "notebooks" / "demo.ipynb"
+            self.assertTrue(mirrored.exists())
+            self.assertEqual(mirrored.read_text(), '{"cells": []}')
+
+    def test_preserves_subdirectory_structure(self):
+        with self._temp_repo() as root, temp_drive() as drive:
+            nested = root / "homework" / "lesson-1"
+            nested.mkdir(parents=True)
+            (nested / "work.ipynb").write_text("{}")
+            course_setup.mirror_notebooks(repo_root=root, once=True)
+            self.assertTrue(
+                (drive / "notebooks" / "homework" / "lesson-1" / "work.ipynb").exists()
+            )
+
+    def test_non_notebook_files_are_ignored(self):
+        with self._temp_repo() as root, temp_drive() as drive:
+            (root / "demo.ipynb").write_text("{}")
+            (root / "notes.txt").write_text("hello")
+            (root / "demo.ipynb.bak").write_text("{}")
+            copied = course_setup.mirror_notebooks(repo_root=root, once=True)
+            self.assertEqual(copied, 1)
+            self.assertFalse((drive / "notebooks" / "notes.txt").exists())
+            self.assertFalse((drive / "notebooks" / "demo.ipynb.bak").exists())
+
+    def test_unchanged_notebook_is_not_recopied(self):
+        with self._temp_repo() as root, temp_drive():
+            (root / "demo.ipynb").write_text("{}")
+            self.assertEqual(course_setup.mirror_notebooks(repo_root=root, once=True), 1)
+            # A second pass with no edits copies nothing (content matches the Drive copy).
+            self.assertEqual(course_setup.mirror_notebooks(repo_root=root, once=True), 0)
+
+    def test_edited_notebook_is_recopied(self):
+        with self._temp_repo() as root, temp_drive():
+            notebook = root / "demo.ipynb"
+            notebook.write_text("{}")
+            course_setup.mirror_notebooks(repo_root=root, once=True)
+            notebook.write_text('{"cells": [1]}')
+            self.assertEqual(course_setup.mirror_notebooks(repo_root=root, once=True), 1)
+
+    def test_no_repo_is_a_noop(self):
+        with tempfile.TemporaryDirectory() as directory, temp_drive():
+            self.assertEqual(
+                course_setup.mirror_notebooks(repo_root=directory, once=True), 0
+            )
+
+    def test_no_drive_is_a_noop(self):
+        with self._temp_repo() as root:
+            (root / "demo.ipynb").write_text("{}")
+            with mock.patch.object(course_setup, "drive_root", return_value=None):
+                self.assertEqual(
+                    course_setup.mirror_notebooks(repo_root=root, once=True), 0
+                )
+
+    def test_auto_mtime_gate_skips_unchanged_files(self):
+        # The --auto loop passes a source_mtimes dict; a file whose mtime has not changed
+        # since the last pass is skipped entirely (not even re-checksummed or copied).
+        with self._temp_repo() as root, temp_drive() as drive:
+            (root / "demo.ipynb").write_text("{}")
+            dest_base = drive / "notebooks"
+            source_mtimes = {}
+            self.assertEqual(
+                course_setup._mirror_once(root, dest_base, source_mtimes), 1
+            )
+            self.assertEqual(
+                course_setup._mirror_once(root, dest_base, source_mtimes), 0
+            )
+
+    def test_noise_directories_are_pruned(self):
+        # Notebooks buried in version-control/cache/venv directories are never mirrored.
+        with self._temp_repo() as root, temp_drive() as drive:
+            for noisy_dir in (".git", "__pycache__", ".venv"):
+                buried = root / noisy_dir
+                buried.mkdir(parents=True, exist_ok=True)
+                (buried / "buried.ipynb").write_text("{}")
+            (root / "real.ipynb").write_text("{}")
+            copied = course_setup.mirror_notebooks(repo_root=root, once=True)
+            self.assertEqual(copied, 1)
+            self.assertTrue((drive / "notebooks" / "real.ipynb").exists())
+            self.assertFalse((drive / "notebooks" / ".git" / "buried.ipynb").exists())
+
+
 class AutoSaverDedupTests(unittest.TestCase):
     def _training_result(self):
         result = mock.Mock()

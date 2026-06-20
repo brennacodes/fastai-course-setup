@@ -853,6 +853,94 @@ def sync(lesson: str, repo_root=None) -> bool:
     return snapshot(repo_root=repo_root, once=True)
 
 
+def _notebook_paths(repo_root: Path):
+    """Yield (absolute_path, path_relative_to_repo) for every notebook under repo_root.
+
+    The same noise directories the autosaver skips are pruned (version control, caches,
+    virtualenvs, the Drive mount, checkpoints), and hidden directories are skipped. Editor
+    backup files such as ``something.ipynb.bak`` are naturally excluded because they do not
+    end in ``.ipynb``.
+    """
+    repo_root = Path(repo_root)
+    for dirpath, dirnames, filenames in os.walk(repo_root):
+        dirnames[:] = [
+            name for name in dirnames
+            if name not in AUTOSAVE_IGNORE_DIRS and not name.startswith(".")
+        ]
+        for filename in filenames:
+            if filename.endswith(".ipynb"):
+                absolute = Path(dirpath) / filename
+                yield absolute, absolute.relative_to(repo_root)
+
+
+def _mirror_once(repo_root: Path, dest_base: Path, source_mtimes: Optional[dict] = None) -> int:
+    """Copy notebooks whose content differs from their Drive copy. Returns the count copied.
+
+    When ``source_mtimes`` is given (the ``--auto`` loop), a notebook is only re-examined if
+    its modification time changed since the last pass, so an idle watcher does no work. The
+    content is still compared by checksum before copying, so an unchanged file is never
+    needlessly re-copied to the (slow) mounted Drive.
+    """
+    copied = 0
+    for absolute, relative in _notebook_paths(repo_root):
+        try:
+            mtime = absolute.stat().st_mtime
+        except OSError:
+            continue
+        unchanged_since_last_pass = (
+            source_mtimes is not None and source_mtimes.get(str(absolute)) == mtime
+        )
+        if not unchanged_since_last_pass:
+            destination = dest_base / relative
+            if not destination.exists() or _sha256(absolute) != _sha256(destination):
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(absolute, destination)
+                _persist_log(f"mirrored notebook '{relative}' -> {destination}")
+                copied += 1
+        if source_mtimes is not None:
+            source_mtimes[str(absolute)] = mtime
+    return copied
+
+
+def mirror_notebooks(repo_root=None, once: bool = True, interval: float = 5.0) -> int:
+    """Copy the repo's notebooks to Drive as you edit, for a faithful off-laptop copy.
+
+    The in-kernel autosaver saves a cell's *results* to Drive, but it cannot save the
+    notebook *file*: on Colab the kernel only ever receives a cell's source when that cell
+    runs, never the ``.ipynb`` document, which your local editor owns. This Mac-side mirror
+    closes that gap. It copies each notebook into ``<drive>/notebooks/<relative path>`` so a
+    faithful copy lands in the same Google Drive account as your artifacts.
+
+    Run it once per session. Like ``snapshot --auto`` it is an independent mtime-poll loop,
+    so a manual ``--once`` run never disturbs a running ``--auto`` watcher (they are separate
+    processes). Returns the number copied on a single pass (``once=True``); the watcher loop
+    returns 0 when interrupted. It is a logged no-op where there is no git repo (Colab) or no
+    Drive, mirroring how ``snapshot``/``restore`` degrade.
+    """
+    root = find_repo_root(repo_root)
+    if root is None:
+        _persist_log("mirror skipped: no git repository here (expected on Colab)")
+        return 0
+    drive = drive_root()
+    if drive is None:
+        _persist_log("mirror skipped: no Drive available")
+        return 0
+    dest_base = drive / "notebooks"
+    if once:
+        copied = _mirror_once(root, dest_base)
+        _persist_log(f"mirror: copied {copied} notebook(s) to {dest_base}")
+        return copied
+    _persist_log("mirror --auto watching notebooks; press Ctrl+C to stop")
+    source_mtimes: dict = {}
+    try:
+        while True:
+            _mirror_once(root, dest_base, source_mtimes)
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        _persist_log("mirror --auto stopped")
+    return 0
+
+
 def restore(lesson: str, dest_root=None) -> int:
     """Copy a lesson's artifacts from Drive back into the working tree. Returns the count.
 
@@ -982,6 +1070,7 @@ def _main(argv=None):
     Examples:
         python course_setup.py snapshot --once
         python course_setup.py snapshot --auto
+        python course_setup.py mirror --auto
         python course_setup.py restore lesson-1
     """
     import argparse
@@ -994,6 +1083,11 @@ def _main(argv=None):
     mode.add_argument("--auto", action="store_true", help="watch and commit continuously")
     mode.add_argument("--once", action="store_true", help="commit once and exit (default)")
 
+    mir = sub.add_parser("mirror", help="copy notebooks to Drive as you edit")
+    mir_mode = mir.add_mutually_exclusive_group()
+    mir_mode.add_argument("--auto", action="store_true", help="watch and mirror continuously")
+    mir_mode.add_argument("--once", action="store_true", help="mirror once and exit (default)")
+
     rest = sub.add_parser("restore", help="copy a lesson's artifacts from Drive into the repo")
     rest.add_argument("lesson", help="lesson name, e.g. lesson-1")
     rest.add_argument(
@@ -1005,6 +1099,8 @@ def _main(argv=None):
     args = parser.parse_args(argv)
     if args.command == "snapshot":
         snapshot(once=not args.auto)
+    elif args.command == "mirror":
+        mirror_notebooks(once=not args.auto)
     elif args.command == "restore":
         restore(args.lesson, dest_root=args.dest)
 
