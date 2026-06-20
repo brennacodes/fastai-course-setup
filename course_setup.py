@@ -252,14 +252,12 @@ DRIVE_DESKTOP_GLOBS = (
     "G:/My Drive",  # common Windows drive letter
 )
 
-# A cell that ran one of these is treated as "this cell trained a model". These are matched
-# as plain substrings against the cell's source, which is deliberately loose: a false
-# positive only costs an extra (cheap) save of a learner-like object, while a false
-# negative would silently fail to protect a trained model, which is the outcome we care
-# about avoiding.
+# A cell whose source contains one of these is treated as "this cell trained a model", so we
+# re-save the model afterwards. Training updates a learner's weights in place, so its object
+# identity does not change and we cannot notice the update by identity alone - the verb is
+# how we know to re-save. Matched as plain substrings, deliberately loose: a false positive
+# only costs one extra cheap save.
 TRAINING_VERBS = ("fine_tune", "fit_one_cycle", "fit_flat_cos", ".fit(")
-# A cell that ran one of these is treated as "this cell built/changed a dataset folder".
-DATA_VERBS = ("download_images", "resize_images", "make_folder_dataset", "untar_data")
 
 # Object ids of models saved during the current cell. The post_run_cell hook checks this so
 # it does not re-save a model that cached_model (or an explicit keep) already persisted in
@@ -474,6 +472,24 @@ def save_dataframe(frame, lesson: str, name: str, source: Optional[dict] = None)
     return target
 
 
+def save_file(file_path, lesson: str, name: str, source: Optional[dict] = None) -> Optional[Path]:
+    """Copy a single file a cell produced to Drive and record it. Returns the path, or None.
+
+    The original location is recorded so restore() can put it back where the notebook wrote
+    it. This is what lets autosave persist arbitrary outputs (a saved .pkl, a CSV, an image)
+    without knowing in advance what kind of thing they are.
+    """
+    directory = artifacts_dir(lesson)
+    if directory is None:
+        return None
+    target = directory / "files" / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(file_path, target)
+    _record_file(lesson, name, "file", target, source, extra={"restore_to": str(Path(file_path))})
+    _persist_log(f"saved file '{name}' -> {target} ({_human_size(target)})")
+    return target
+
+
 def cached_model(lesson, name, build_fn, load_fn=None, source=None):
     """Return an existing model from Drive if present, else build then save it.
 
@@ -538,33 +554,54 @@ def _looks_like_learner(obj) -> bool:
     return callable(getattr(obj, "export", None)) and callable(getattr(obj, "predict", None))
 
 
-def detect_models_to_save(cell_source: str, namespace: dict):
-    """Decide which trained models a just-run cell produced. Pure and side-effect free.
+def _saveable_kind(obj) -> Optional[str]:
+    """Classify a namespace object as a saveable artifact, or None to leave it alone.
 
-    Given the cell's source text and the notebook namespace, return the list of
-    ``(variable_name, learner)`` pairs worth saving now. The rule: if the cell ran a
-    training call, every learner-like object currently in the namespace is worth saving
-    (re-saving simply overwrites with the latest weights). Being a pure function makes
-    this trivial to unit test without a real kernel or fastai.
+    'model' for a fastai Learner (anything with export + predict); 'dataframe' for a pandas
+    DataFrame (anything with to_csv + columns). Everything else - numbers, strings, plots,
+    DataLoaders - returns None, so autosave persists results, not every variable that exists.
     """
-    if not any(verb in cell_source for verb in TRAINING_VERBS):
-        return []
-    found = []
-    for name, value in list(namespace.items()):
-        if name.startswith("_"):
-            continue
-        if _looks_like_learner(value):
-            found.append((name, value))
-    return found
+    if _looks_like_learner(obj):
+        return "model"
+    if callable(getattr(obj, "to_csv", None)) and getattr(obj, "columns", None) is not None:
+        return "dataframe"
+    return None
 
 
-def _folder_signature(path: Path):
-    """A cheap (file count, total bytes) fingerprint used to notice a folder changed."""
-    path = Path(path)
-    if not path.exists():
-        return (0, 0)
-    files = [item for item in path.rglob("*") if item.is_file()]
-    return (len(files), sum(item.stat().st_size for item in files))
+# Directory names never scanned when looking for files a cell produced: version control,
+# caches, virtualenvs, the mounted Drive itself, and Colab's bundled sample data. Hidden
+# directories (names starting with ".") are skipped too.
+AUTOSAVE_IGNORE_DIRS = {
+    ".git", ".ipynb_checkpoints", "__pycache__", ".cache", ".config", ".local",
+    "node_modules", ".venv", "venv", "env", "drive", "sample_data", ".fastai-course-setup",
+}
+
+# A guard so the after-cell scan stays fast even if the working tree is enormous.
+AUTOSAVE_MAX_FILES = 20000
+
+
+def _scan_tree(root: Path) -> dict:
+    """Map file path -> modification time for files under root, skipping noise directories.
+
+    Used to notice which files a cell created or changed so they can be mirrored to Drive.
+    Caches, virtualenvs, the Drive mount and hidden folders are pruned so we only see the
+    user's actual working files.
+    """
+    index = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [
+            name for name in dirnames
+            if name not in AUTOSAVE_IGNORE_DIRS and not name.startswith(".")
+        ]
+        for filename in filenames:
+            path = os.path.join(dirpath, filename)
+            try:
+                index[path] = os.path.getmtime(path)
+            except OSError:
+                continue
+            if len(index) >= AUTOSAVE_MAX_FILES:
+                return index
+    return index
 
 
 def _get_ipython():
@@ -597,23 +634,28 @@ def current_notebook() -> Optional[str]:
 
 
 class AutoSaver:
-    """Watches cell executions and saves expensive results to Drive automatically.
+    """Ambient autosave: after every cell, save whatever that cell produced to Drive.
 
-    Turned on by ``init(autosave=True, ...)``. It registers a callback on IPython's
-    ``post_run_cell`` event - the very signal behind the run-count and the success/error
-    mark next to each cell - so it runs after every cell. When a cell that trained a model
-    finishes, the model is exported to Drive and recorded in the manifest, tagged with the
-    cell that produced it. You can also mark things by hand with ``keep(...)`` /
-    ``keep_folder(...)``, and have a data folder auto-saved when it grows by registering it
-    with ``watch(...)``.
+    Turned on by ``init(autosave=True, ...)`` and needs no per-cell code. It registers a
+    callback on IPython's ``post_run_cell`` event - the signal behind the run-count and the
+    success/error mark next to each cell - so it runs after every cell in any notebook. Each
+    run it saves: (a) models and dataframes that appeared or changed in the notebook, and
+    (b) any files or folders the cell wrote under the working directory. Everything is
+    recorded in a per-lesson manifest, tagged with the notebook and cell that produced it.
+    ``keep(...)`` / ``keep_folder(...)`` remain for forcing a save by hand, and the bin
+    scripts (snapshot/restore) are the manual on-demand levers.
     """
 
     def __init__(self, lesson: str):
         self.lesson = lesson
         self._registered = False
-        self._watched = {}  # name -> [Path, last_signature]
         self._ignored = set()
         self._execution_count = 0
+        # Working-tree snapshot (file path -> mtime); None until the first cell establishes
+        # a baseline, so pre-existing files are not all re-saved on the first run.
+        self._file_index = None
+        # Variable name -> id of the object last saved under it, to notice new/changed ones.
+        self._object_index = {}
 
     def register(self) -> "AutoSaver":
         """Subscribe to the cell-execution event. No-op (with a note) outside a kernel."""
@@ -628,12 +670,6 @@ class AutoSaver:
         _autosave_hook_active = True
         self._registered = True
         _persist_log(f"autosave on for lesson '{self.lesson}'")
-        return self
-
-    def watch(self, folder, name: str) -> "AutoSaver":
-        """Auto-save a data folder whenever it grows after a data-building cell."""
-        path = Path(folder)
-        self._watched[name] = [path, _folder_signature(path)]
         return self
 
     def ignore(self, name: str) -> "AutoSaver":
@@ -664,36 +700,77 @@ class AutoSaver:
         return info
 
     def _on_post_run_cell(self, result) -> None:
-        """Run after every cell; save anything expensive it produced. Never raises."""
+        """Run after every cell; save whatever artifacts it produced. Never raises."""
         try:
             self._execution_count += 1
             if getattr(result, "success", True) is False:
-                return  # a cell that errored did not produce a trustworthy artifact
+                return  # a cell that errored did not produce a trustworthy result
             cell_source = getattr(getattr(result, "info", None), "raw_cell", "") or ""
-            for name, learner in detect_models_to_save(cell_source, _user_namespace()):
-                # Skip models the user opted out of, and any that cached_model/keep already
-                # saved in this same cell (so we never write a duplicate copy).
-                if name in self._ignored or id(learner) in _models_saved_this_cell:
-                    continue
-                save_model(learner, self.lesson, name, self._source(cell_source))
-            self._save_grown_folders(cell_source)
+            self._save_namespace_objects(cell_source)
+            self._save_new_files(cell_source)
         except Exception as error:  # autosave must never break the user's notebook
             _persist_log(f"autosave skipped a cell after an error: {error!r}")
         finally:
             # Reset the per-cell de-dup set so the next cell starts clean.
             _models_saved_this_cell.clear()
 
-    def _save_grown_folders(self, cell_source: str) -> None:
-        """Save any watched folder that grew, but only after a data-building cell."""
-        if not any(verb in cell_source for verb in DATA_VERBS):
-            return
-        for name, (path, last_signature) in list(self._watched.items()):
-            if name in self._ignored:
+    def _save_namespace_objects(self, cell_source: str) -> None:
+        """Save models / dataframes this cell created or (re)trained."""
+        trained = any(verb in cell_source for verb in TRAINING_VERBS)
+        for name, value in list(_user_namespace().items()):
+            if name.startswith("_") or name in self._ignored:
                 continue
-            signature = _folder_signature(path)
-            if signature != last_signature and signature[0] > 0:
-                save_folder(path, self.lesson, name, self._source(cell_source))
-                self._watched[name][1] = signature
+            if id(value) in _models_saved_this_cell:
+                continue  # already saved by cached_model/keep in this same cell
+            kind = _saveable_kind(value)
+            if kind is None:
+                continue
+            is_new = self._object_index.get(name) != id(value)
+            if kind == "model" and trained:
+                # Save a model only when a cell actually trained one, not when an untrained
+                # learner is first constructed (that would waste tens of MB on empty weights).
+                save_model(value, self.lesson, name, self._source(cell_source))
+                self._object_index[name] = id(value)
+            elif kind == "dataframe" and is_new:
+                save_dataframe(value, self.lesson, name, self._source(cell_source))
+                self._object_index[name] = id(value)
+
+    def _save_new_files(self, cell_source: str) -> None:
+        """Mirror files this cell created or changed under the working dir to Drive."""
+        root = Path.cwd()
+        current = _scan_tree(root)
+        if self._file_index is None:
+            # First cell: record what already existed so we don't re-save the whole tree.
+            self._file_index = current
+            return
+        touched = {
+            path for path in set(current) | set(self._file_index)
+            if current.get(path) != self._file_index.get(path)
+        }
+        self._file_index = current
+        if not touched:
+            return
+        # Group touched paths by their first directory under the working dir: loose files in
+        # the working dir are saved individually, while a changed subdirectory (a dataset)
+        # is zipped once as a whole.
+        loose_files = []
+        changed_subdirs = set()
+        for path in touched:
+            try:
+                relative = Path(path).relative_to(root)
+            except ValueError:
+                continue
+            if len(relative.parts) == 1:
+                loose_files.append(path)
+            else:
+                changed_subdirs.add(relative.parts[0])
+        for path in loose_files:
+            if Path(path).exists() and Path(path).name not in self._ignored:
+                save_file(path, self.lesson, Path(path).name, self._source(cell_source))
+        for subdir in changed_subdirs:
+            folder = root / subdir
+            if subdir not in self._ignored and folder.is_dir():
+                save_folder(folder, self.lesson, subdir, self._source(cell_source))
 
 
 def find_repo_root(start: Optional[str] = None) -> Optional[Path]:
@@ -803,19 +880,24 @@ def restore(lesson: str, dest_root=None) -> int:
             # than silently undercount.
             _persist_log(f"restore: skipping '{name}' (not found at {source})")
             continue
-        if entry.get("kind") == "dataset" and source.suffix == ".zip":
-            # Put the images back exactly where the notebook reads them, using the path we
-            # recorded at save time. A relative recorded path is resolved against dest_root;
-            # an absolute one is used as-is; with no recorded path we fall back generically.
-            recorded = entry.get("restore_to")
-            if recorded:
-                candidate = Path(recorded)
-                target_dir = candidate if candidate.is_absolute() else dest_root / candidate
-            else:
-                target_dir = dest_root / "datasets" / name
-            unzip_dir(source, target_dir)
+        # Put things back where the notebook wrote them, using the path recorded at save
+        # time. A relative recorded path is resolved against dest_root; an absolute one is
+        # used as-is; with no recorded path we fall back to a generic per-kind location.
+        kind = entry.get("kind")
+        recorded = entry.get("restore_to")
+        if recorded:
+            candidate = Path(recorded)
+            recorded_target = candidate if candidate.is_absolute() else dest_root / candidate
         else:
-            subdir = "models" if entry.get("kind") == "model" else "datasets"
+            recorded_target = None
+
+        if kind == "dataset" and source.suffix == ".zip":
+            unzip_dir(source, recorded_target or dest_root / "datasets" / name)
+        elif kind == "file" and recorded_target is not None:
+            recorded_target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, recorded_target)
+        else:
+            subdir = "models" if kind == "model" else "datasets"
             target = dest_root / subdir / source.name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)

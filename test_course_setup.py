@@ -52,6 +52,16 @@ class FakeLearner:
         return "pill"
 
 
+class FakeFrame:
+    """Stand-in for a pandas DataFrame: has to_csv and columns, so _saveable_kind sees it
+    as a 'dataframe' (and not as a learner, since it has no export/predict)."""
+
+    columns = ["a"]
+
+    def to_csv(self, path, index=False):
+        Path(path).write_text("a\n")
+
+
 class DetectEnvTests(unittest.TestCase):
     def test_local_when_no_platform_markers(self):
         # google.colab set to None makes "import google.colab" raise -> not Colab;
@@ -410,25 +420,102 @@ class CachedHelpersTests(unittest.TestCase):
             self.assertEqual(rebuilt, [])
 
 
-class DetectModelsTests(unittest.TestCase):
-    def test_training_cell_with_learner_is_detected(self):
+class SaveableKindTests(unittest.TestCase):
+    def test_learner_is_a_model(self):
+        self.assertEqual(course_setup._saveable_kind(FakeLearner()), "model")
+
+    def test_dataframe_is_a_dataframe(self):
+        self.assertEqual(course_setup._saveable_kind(FakeFrame()), "dataframe")
+
+    def test_plain_values_are_skipped(self):
+        for value in (42, "hi", [1, 2, 3], {"a": 1}):
+            self.assertIsNone(course_setup._saveable_kind(value))
+
+
+class AmbientObjectSaveTests(unittest.TestCase):
+    """The hook saves models on training cells and dataframes when they appear."""
+
+    def setUp(self):
+        course_setup._models_saved_this_cell.clear()
+        self.addCleanup(course_setup._models_saved_this_cell.clear)
+
+    def test_model_saved_only_on_a_training_cell(self):
+        saver = course_setup.AutoSaver("lesson-1")
         learner = FakeLearner()
-        found = course_setup.detect_models_to_save(
-            "learn.fine_tune(3)", {"learn": learner, "x": 5}
-        )
-        self.assertEqual(found, [("learn", learner)])
+        ns = {"learn": learner}
+        with mock.patch.object(course_setup, "_user_namespace", return_value=ns), \
+            mock.patch.object(course_setup, "save_model") as fake_save:
+            saver._save_namespace_objects("learn = vision_learner(dls, resnet18)")
+        fake_save.assert_not_called()  # constructed but not trained -> not saved
 
-    def test_non_training_cell_detects_nothing(self):
-        found = course_setup.detect_models_to_save(
-            "dls.show_batch()", {"learn": FakeLearner()}
-        )
-        self.assertEqual(found, [])
+        with mock.patch.object(course_setup, "_user_namespace", return_value=ns), \
+            mock.patch.object(course_setup, "save_model") as fake_save:
+            saver._save_namespace_objects("learn.fine_tune(3)")
+        fake_save.assert_called_once()  # trained -> saved
 
-    def test_underscored_names_are_ignored(self):
-        found = course_setup.detect_models_to_save(
-            "learn.fit_one_cycle(1)", {"_hidden": FakeLearner()}
-        )
-        self.assertEqual(found, [])
+    def test_new_dataframe_is_saved(self):
+        saver = course_setup.AutoSaver("lesson-1")
+        with mock.patch.object(course_setup, "_user_namespace", return_value={"df": FakeFrame()}), \
+            mock.patch.object(course_setup, "save_dataframe") as fake_save:
+            saver._save_namespace_objects("df = pd.read_csv(url)")
+        fake_save.assert_called_once()
+
+    def test_underscored_and_ignored_names_are_skipped(self):
+        saver = course_setup.AutoSaver("lesson-1").ignore("learn")
+        ns = {"_hidden": FakeLearner(), "learn": FakeLearner()}
+        with mock.patch.object(course_setup, "_user_namespace", return_value=ns), \
+            mock.patch.object(course_setup, "save_model") as fake_save:
+            saver._save_namespace_objects("learn.fine_tune(1)")
+        fake_save.assert_not_called()
+
+
+class AmbientFileSaveTests(unittest.TestCase):
+    """The hook mirrors files/folders a cell writes under the working directory."""
+
+    def test_first_cell_only_sets_a_baseline(self):
+        saver = course_setup.AutoSaver("lesson-1")
+        with mock.patch.object(course_setup, "save_file") as ffile, \
+            mock.patch.object(course_setup, "save_folder") as ffolder:
+            saver._save_new_files("")  # _file_index is None -> just record the baseline
+        ffile.assert_not_called()
+        ffolder.assert_not_called()
+        self.assertIsNotNone(saver._file_index)
+
+    def test_loose_file_is_saved_individually(self):
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as workspace:
+            try:
+                os.chdir(workspace)
+                saver = course_setup.AutoSaver("lesson-1")
+                saver._file_index = {}  # baseline already taken, nothing existed
+                Path("result.pkl").write_text("x")
+                with mock.patch.object(course_setup, "save_file") as ffile, \
+                    mock.patch.object(course_setup, "save_folder") as ffolder:
+                    saver._save_new_files("learn.export('result.pkl')")
+                ffile.assert_called_once()
+                self.assertEqual(Path(ffile.call_args.args[0]).name, "result.pkl")
+                ffolder.assert_not_called()
+            finally:
+                os.chdir(original_cwd)
+
+    def test_changed_subdirectory_is_zipped_once(self):
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as workspace:
+            try:
+                os.chdir(workspace)
+                saver = course_setup.AutoSaver("lesson-1")
+                saver._file_index = {}
+                (Path("data") / "imgs").mkdir(parents=True)
+                (Path("data") / "imgs" / "a.jpg").write_text("x")
+                (Path("data") / "imgs" / "b.jpg").write_text("y")
+                with mock.patch.object(course_setup, "save_file") as ffile, \
+                    mock.patch.object(course_setup, "save_folder") as ffolder:
+                    saver._save_new_files("download_images(...)")
+                ffolder.assert_called_once()
+                self.assertEqual(Path(ffolder.call_args.args[0]).name, "data")
+                ffile.assert_not_called()
+            finally:
+                os.chdir(original_cwd)
 
 
 class KeepTests(unittest.TestCase):
