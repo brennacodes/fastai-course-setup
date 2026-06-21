@@ -233,7 +233,8 @@ class InitTests(unittest.TestCase):
             mock.patch.object(course_setup, "ensure_packages", manager.ensure_packages), \
             mock.patch.object(course_setup, "download_competition", manager.download_competition), \
             mock.patch.object(course_setup, "set_wide_print", manager.set_wide_print), \
-            mock.patch.object(course_setup, "select_device", manager.select_device):
+            mock.patch.object(course_setup, "select_device", manager.select_device), \
+            mock.patch.object(course_setup, "_start_auto_sync"):
             manager.download_competition.return_value = Path("titanic")
             manager.select_device.return_value = "device:cpu"
             context = course_setup.init(
@@ -263,7 +264,8 @@ class InitTests(unittest.TestCase):
             mock.patch.object(course_setup, "ensure_packages"), \
             mock.patch.object(course_setup, "download_competition") as fake_download, \
             mock.patch.object(course_setup, "set_wide_print") as fake_wide, \
-            mock.patch.object(course_setup, "select_device", return_value="device:cpu"):
+            mock.patch.object(course_setup, "select_device", return_value="device:cpu"), \
+            mock.patch.object(course_setup, "_start_auto_sync"):
             context = course_setup.init()
         fake_download.assert_not_called()
         fake_wide.assert_not_called()
@@ -565,6 +567,67 @@ class SnapshotTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             self.assertFalse(course_setup.snapshot(repo_root=directory, once=True))
 
+    @contextmanager
+    def _temp_git_repo_with_remote(self):
+        """A working repo wired to a bare 'origin' with an upstream already set.
+
+        ``_push_to_remote`` runs a bare ``git push`` (no args), which needs the branch to have
+        an upstream. So we seed one commit and push it with ``-u`` to establish that upstream;
+        tests then assert that a later snapshot's push moves the remote forward.
+        """
+        with tempfile.TemporaryDirectory() as work_dir, tempfile.TemporaryDirectory() as remote_dir:
+            root = Path(work_dir)
+            subprocess.run(["git", "-C", work_dir, "init", "-q"], check=True)
+            subprocess.run(["git", "-C", work_dir, "config", "user.email", "t@t.test"], check=True)
+            subprocess.run(["git", "-C", work_dir, "config", "user.name", "Test"], check=True)
+            subprocess.run(["git", "init", "--bare", "-q", remote_dir], check=True)
+            subprocess.run(["git", "-C", work_dir, "remote", "add", "origin", remote_dir], check=True)
+            (root / "seed.txt").write_text("seed")
+            subprocess.run(["git", "-C", work_dir, "add", "seed.txt"], check=True)
+            subprocess.run(["git", "-C", work_dir, "commit", "-q", "-m", "seed"], check=True)
+            subprocess.run(["git", "-C", work_dir, "push", "-q", "-u", "origin", "HEAD"], check=True)
+            yield root, Path(remote_dir)
+
+    def _head(self, root):
+        result = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            capture_output=True, text=True,
+        )
+        return result.stdout.strip()
+
+    def test_pushes_after_commit(self):
+        with self._temp_git_repo_with_remote() as (root, remote):
+            (root / "demo.ipynb").write_text("{}")
+            self.assertTrue(course_setup.snapshot(repo_root=root, once=True))
+            # The new commit reached the bare remote: both point at the same HEAD.
+            self.assertEqual(self._head(root), self._head(remote))
+
+    def test_push_false_commits_without_pushing(self):
+        with self._temp_git_repo_with_remote() as (root, remote):
+            remote_before = self._head(remote)
+            (root / "demo.ipynb").write_text("{}")
+            self.assertTrue(course_setup.snapshot(repo_root=root, once=True, push=False))
+            # Local advanced, remote did not.
+            self.assertNotEqual(self._head(root), self._head(remote))
+            self.assertEqual(self._head(remote), remote_before)
+
+    def test_push_failure_is_swallowed(self):
+        # A repo with no remote: the push fails, but the commit must still succeed and the
+        # call must not raise.
+        with self._temp_git_repo() as root:
+            (root / "demo.ipynb").write_text("{}")
+            self.assertTrue(course_setup.snapshot(repo_root=root, once=True))
+            self.assertEqual(self._commit_count(root), 1)
+
+    def test_push_is_attempted_on_every_commit(self):
+        # The commit path must actually call the push, not just optionally; a real failing push
+        # is covered above, here we assert the attempt happens and does not change the result.
+        with self._temp_git_repo() as root:
+            (root / "demo.ipynb").write_text("{}")
+            with mock.patch.object(course_setup, "_push_to_remote", return_value=False) as push:
+                self.assertTrue(course_setup.snapshot(repo_root=root, once=True))
+                push.assert_called_once()
+
 
 class MirrorTests(unittest.TestCase):
     """The Mac-side notebook-to-Drive mirror (mirror_notebooks)."""
@@ -659,6 +722,388 @@ class MirrorTests(unittest.TestCase):
             self.assertEqual(copied, 1)
             self.assertTrue((drive / "notebooks" / "real.ipynb").exists())
             self.assertFalse((drive / "notebooks" / ".git" / "buried.ipynb").exists())
+
+
+class PullTests(unittest.TestCase):
+    """The Mac-side round-trip that brings Colab edits home (pull_notebooks + merge).
+
+    These build real notebooks with nbformat so the three sides share stable cell ids, which
+    is what lets nbdime tell a genuine conflict from two edits to different cells.
+    """
+
+    @contextmanager
+    def _temp_repo(self):
+        with tempfile.TemporaryDirectory() as directory:
+            subprocess.run(["git", "-C", directory, "init", "-q"], check=True)
+            yield Path(directory)
+
+    def _make_notebook(self, path, sources):
+        import nbformat
+        from nbformat.v4 import new_markdown_cell, new_notebook
+
+        node = new_notebook(cells=[new_markdown_cell(text) for text in sources])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        nbformat.write(node, str(path))
+
+    def _edit_cell(self, path, index, new_source):
+        import nbformat
+
+        node = nbformat.read(str(path), as_version=4)
+        node.cells[index].source = new_source
+        nbformat.write(node, str(path))
+
+    def _cell_sources(self, path):
+        import nbformat
+
+        node = nbformat.read(str(path), as_version=4)
+        return [cell.source for cell in node.cells]
+
+    def test_new_local_notebook_seeds_drive_and_base(self):
+        with self._temp_repo() as root, temp_drive() as drive:
+            self._make_notebook(root / "demo.ipynb", ["alpha", "beta"])
+            self.assertEqual(course_setup.pull_notebooks(repo_root=root, once=True), 0)
+            self.assertTrue((drive / "notebooks" / "demo.ipynb").exists())
+            self.assertTrue((drive / "notebooks" / ".sync-base" / "demo.ipynb").exists())
+
+    def test_new_colab_notebook_is_pulled_down(self):
+        with self._temp_repo() as root, temp_drive() as drive:
+            self._make_notebook(drive / "notebooks" / "demo.ipynb", ["from colab"])
+            self.assertEqual(course_setup.pull_notebooks(repo_root=root, once=True), 1)
+            self.assertEqual(self._cell_sources(root / "demo.ipynb"), ["from colab"])
+
+    def test_only_drive_changed_updates_mac(self):
+        with self._temp_repo() as root, temp_drive() as drive:
+            mac = root / "demo.ipynb"
+            self._make_notebook(mac, ["alpha", "beta"])
+            course_setup.pull_notebooks(repo_root=root, once=True)  # seed base
+            self._edit_cell(drive / "notebooks" / "demo.ipynb", 1, "beta on colab")
+            self.assertEqual(course_setup.pull_notebooks(repo_root=root, once=True), 1)
+            self.assertEqual(self._cell_sources(mac)[1], "beta on colab")
+
+    def test_only_mac_changed_updates_drive(self):
+        with self._temp_repo() as root, temp_drive() as drive:
+            mac = root / "demo.ipynb"
+            self._make_notebook(mac, ["alpha", "beta"])
+            course_setup.pull_notebooks(repo_root=root, once=True)  # seed base
+            self._edit_cell(mac, 0, "alpha on mac")
+            self.assertEqual(course_setup.pull_notebooks(repo_root=root, once=True), 0)
+            self.assertEqual(
+                self._cell_sources(drive / "notebooks" / "demo.ipynb")[0], "alpha on mac"
+            )
+
+    def test_clean_merge_of_disjoint_edits(self):
+        with self._temp_repo() as root, temp_drive() as drive:
+            mac = root / "demo.ipynb"
+            self._make_notebook(mac, ["alpha", "beta"])
+            course_setup.pull_notebooks(repo_root=root, once=True)  # seed base
+            self._edit_cell(mac, 0, "alpha on mac")
+            self._edit_cell(drive / "notebooks" / "demo.ipynb", 1, "beta on colab")
+            self.assertEqual(course_setup.pull_notebooks(repo_root=root, once=True), 1)
+            self.assertEqual(self._cell_sources(mac), ["alpha on mac", "beta on colab"])
+            self.assertFalse((root / "demo.merge-conflict.ipynb").exists())
+
+    def test_disjoint_line_edits_in_one_cell_merge_cleanly(self):
+        # nbdime merges a cell's source line by line, so edits to different lines of the SAME
+        # cell auto-merge without a conflict and keep both. Verify that, so we know this common
+        # case is not silently lossy.
+        with self._temp_repo() as root, temp_drive() as drive:
+            mac = root / "demo.ipynb"
+            self._make_notebook(mac, ["line one\nline two\nline three"])
+            course_setup.pull_notebooks(repo_root=root, once=True)  # seed base
+            self._edit_cell(mac, 0, "LINE ONE (mac)\nline two\nline three")
+            self._edit_cell(
+                drive / "notebooks" / "demo.ipynb", 0, "line one\nline two\nLINE THREE (colab)"
+            )
+            self.assertEqual(course_setup.pull_notebooks(repo_root=root, once=True), 1)
+            merged = self._cell_sources(mac)[0]
+            self.assertIn("LINE ONE (mac)", merged)
+            self.assertIn("LINE THREE (colab)", merged)
+            self.assertFalse((root / "demo.merge-conflict.ipynb").exists())
+
+    def test_conflicting_edits_pause_without_overwriting(self):
+        with self._temp_repo() as root, temp_drive() as drive:
+            mac = root / "demo.ipynb"
+            self._make_notebook(mac, ["alpha", "beta"])
+            course_setup.pull_notebooks(repo_root=root, once=True)  # seed base
+            base_file = drive / "notebooks" / ".sync-base" / "demo.ipynb"
+            base_before = base_file.read_text()
+            self._edit_cell(mac, 0, "alpha MAC")
+            self._edit_cell(drive / "notebooks" / "demo.ipynb", 0, "alpha COLAB")
+            self.assertEqual(course_setup.pull_notebooks(repo_root=root, once=True), 0)
+            # The Mac copy is untouched, a conflict scratch is written, and the base is intact.
+            self.assertEqual(self._cell_sources(mac)[0], "alpha MAC")
+            self.assertTrue((root / "demo.merge-conflict.ipynb").exists())
+            self.assertEqual(base_file.read_text(), base_before)
+
+    def test_resolve_conflict_advances_base_and_clears_scratch(self):
+        with self._temp_repo() as root, temp_drive() as drive:
+            mac = root / "demo.ipynb"
+            self._make_notebook(mac, ["alpha", "beta"])
+            course_setup.pull_notebooks(repo_root=root, once=True)  # seed base
+            self._edit_cell(mac, 0, "alpha MAC")
+            self._edit_cell(drive / "notebooks" / "demo.ipynb", 0, "alpha COLAB")
+            course_setup.pull_notebooks(repo_root=root, once=True)  # produces the conflict
+            # The user resolves by editing the real notebook, then accepts it.
+            self._edit_cell(mac, 0, "alpha RESOLVED")
+            self.assertTrue(course_setup.resolve_conflict("demo.ipynb", repo_root=root))
+            self.assertFalse((root / "demo.merge-conflict.ipynb").exists())
+            self.assertEqual(
+                self._cell_sources(drive / "notebooks" / "demo.ipynb")[0], "alpha RESOLVED"
+            )
+            # Everything now agrees, so a further pass has nothing to do.
+            self.assertEqual(course_setup.pull_notebooks(repo_root=root, once=True), 0)
+
+    def test_conflict_scratch_is_not_committed(self):
+        with self._temp_repo() as root, temp_drive() as drive:
+            subprocess.run(["git", "-C", str(root), "config", "user.email", "t@t.test"], check=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.name", "Test"], check=True)
+            mac = root / "demo.ipynb"
+            self._make_notebook(mac, ["alpha", "beta"])
+            course_setup.pull_notebooks(repo_root=root, once=True)  # seed base
+            self._edit_cell(mac, 0, "alpha MAC")
+            self._edit_cell(drive / "notebooks" / "demo.ipynb", 0, "alpha COLAB")
+            course_setup.pull_notebooks(repo_root=root, once=True)  # produces the conflict
+            self.assertTrue((root / "demo.merge-conflict.ipynb").exists())
+            course_setup.snapshot(repo_root=root, once=True, push=False)
+            tracked = subprocess.run(
+                ["git", "-C", str(root), "ls-files"], capture_output=True, text=True
+            ).stdout
+            self.assertIn("demo.ipynb", tracked)
+            self.assertNotIn("merge-conflict", tracked)
+
+    def test_unreadable_mac_copy_is_not_overwritten(self):
+        # If the Mac file exists but is momentarily unparseable (mid-save), pull must not treat
+        # it as absent and copy Drive down over it. It should skip and leave the Mac bytes alone.
+        with self._temp_repo() as root, temp_drive() as drive:
+            mac = root / "demo.ipynb"
+            self._make_notebook(mac, ["alpha", "beta"])
+            course_setup.pull_notebooks(repo_root=root, once=True)  # seed base + Drive
+            self._edit_cell(drive / "notebooks" / "demo.ipynb", 0, "newer on colab")
+            mac.write_text("{ this is not valid notebook json")  # a half-written save
+            self.assertEqual(course_setup.pull_notebooks(repo_root=root, once=True), 0)
+            self.assertEqual(mac.read_text(), "{ this is not valid notebook json")
+
+
+class ExportTests(unittest.TestCase):
+    """The Colab-side notebook export (export_notebook_to_drive) and its Drive path index."""
+
+    @contextmanager
+    def _temp_repo(self):
+        with tempfile.TemporaryDirectory() as directory:
+            subprocess.run(["git", "-C", directory, "init", "-q"], check=True)
+            yield Path(directory)
+
+    def _make_notebook(self, path, sources):
+        import nbformat
+        from nbformat.v4 import new_markdown_cell, new_notebook
+
+        node = new_notebook(cells=[new_markdown_cell(text) for text in sources])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        nbformat.write(node, str(path))
+
+    @contextmanager
+    def _fake_colab(self, notebook_dict=None, raises=False):
+        """Inject a stand-in google.colab._message so export runs as if on Colab."""
+        import types
+
+        message = types.ModuleType("google.colab._message")
+        message.calls = []
+
+        def blocking_request(*args, **kwargs):
+            message.calls.append((args, kwargs))
+            if raises:
+                raise RuntimeError("colab internals changed")
+            return {"ipynb": notebook_dict}
+
+        message.blocking_request = blocking_request
+        colab = types.ModuleType("google.colab")
+        colab._message = message
+        google = types.ModuleType("google")
+        google.colab = colab
+        with mock.patch.dict(
+            sys.modules,
+            {"google": google, "google.colab": colab, "google.colab._message": message},
+        ):
+            yield message
+
+    def test_returns_false_without_drive(self):
+        with mock.patch.object(course_setup, "drive_root", return_value=None):
+            self.assertFalse(course_setup.export_notebook_to_drive())
+
+    def test_returns_false_off_colab(self):
+        with temp_drive():
+            # No google.colab in this environment, so the import fails and export bails out.
+            self.assertFalse(course_setup.export_notebook_to_drive())
+
+    def test_failure_is_loud_but_harmless(self):
+        with temp_drive(), self._fake_colab(raises=True):
+            # blocking_request raises (Colab 'changed'); export must swallow it, not crash.
+            self.assertFalse(course_setup.export_notebook_to_drive())
+
+    def test_writes_to_resolved_repo_path(self):
+        import nbformat
+
+        with self._temp_repo() as root, temp_drive() as drive:
+            nested = root / "homework" / "lesson-1" / "work.ipynb"
+            self._make_notebook(nested, ["original"])
+            course_setup.mirror_notebooks(repo_root=root, once=True)  # writes the path index
+            exported = nbformat.v4.new_notebook(
+                cells=[nbformat.v4.new_markdown_cell("edited on colab")]
+            )
+            notebook_dict = json.loads(nbformat.writes(exported))
+            with self._fake_colab(notebook_dict=notebook_dict) as colab_message, mock.patch.object(
+                course_setup, "current_notebook", return_value="work.ipynb"
+            ):
+                self.assertTrue(course_setup.export_notebook_to_drive())
+            # It asked Colab for the notebook via the documented message type.
+            self.assertEqual(colab_message.calls[0][0][0], "get_ipynb")
+            written = drive / "notebooks" / "homework" / "lesson-1" / "work.ipynb"
+            self.assertTrue(written.exists())
+            self.assertEqual(
+                nbformat.read(str(written), as_version=4).cells[0].source, "edited on colab"
+            )
+
+    def test_skips_when_basename_is_ambiguous(self):
+        with self._temp_repo() as root, temp_drive() as drive:
+            self._make_notebook(root / "a" / "work.ipynb", ["a"])
+            self._make_notebook(root / "b" / "work.ipynb", ["b"])
+            course_setup.mirror_notebooks(repo_root=root, once=True)  # two 'work.ipynb' in index
+            self.assertIsNone(
+                course_setup._resolve_export_relpath(drive / "notebooks", "work.ipynb")
+            )
+
+    def test_unindexed_notebook_lands_in_from_colab_folder(self):
+        # A notebook created on Colab (never mirrored, so not in the index) must not be dropped;
+        # it lands under _from-colab/ for the Mac to pick up.
+        import nbformat
+
+        with temp_drive() as drive:
+            exported = nbformat.v4.new_notebook(cells=[nbformat.v4.new_markdown_cell("born here")])
+            notebook_dict = json.loads(nbformat.writes(exported))
+            with self._fake_colab(notebook_dict=notebook_dict), mock.patch.object(
+                course_setup, "current_notebook", return_value="novel.ipynb"
+            ):
+                self.assertTrue(course_setup.export_notebook_to_drive())
+            landed = drive / "notebooks" / "_from-colab" / "novel.ipynb"
+            self.assertTrue(landed.exists())
+            self.assertEqual(
+                nbformat.read(str(landed), as_version=4).cells[0].source, "born here"
+            )
+
+
+class AutoSyncTests(unittest.TestCase):
+    """The init-driven auto-sync: the SyncDaemon's pass and which half _start_auto_sync picks."""
+
+    def _env(self, in_colab=False, iscolab=False):
+        return course_setup.Environment(in_colab=in_colab, iskaggle=False, iscolab=iscolab)
+
+    def test_daemon_run_once_calls_pull_mirror_snapshot(self):
+        with mock.patch.object(course_setup, "pull_notebooks") as pull, mock.patch.object(
+            course_setup, "mirror_notebooks"
+        ) as mirror, mock.patch.object(course_setup, "snapshot") as snap:
+            course_setup.SyncDaemon("/tmp/repo").run_once()
+            pull.assert_called_once_with(repo_root=Path("/tmp/repo"), once=True)
+            mirror.assert_called_once_with(repo_root=Path("/tmp/repo"), once=True)
+            snap.assert_called_once_with(repo_root=Path("/tmp/repo"), once=True)
+
+    def test_daemon_isolates_a_failing_step(self):
+        # A failing pull must not stop mirror and snapshot from running in the same pass.
+        with mock.patch.object(
+            course_setup, "pull_notebooks", side_effect=RuntimeError("boom")
+        ), mock.patch.object(course_setup, "mirror_notebooks") as mirror, mock.patch.object(
+            course_setup, "snapshot"
+        ) as snap:
+            course_setup.SyncDaemon("/tmp/repo").run_once()
+            mirror.assert_called_once()
+            snap.assert_called_once()
+
+    def test_start_auto_sync_starts_daemon_when_repo_present(self):
+        class FakeDaemon:
+            def __init__(self, repo_root, interval=5.0):
+                self.repo_root = repo_root
+                self.started = False
+
+            def start(self):
+                self.started = True
+                return self
+
+        with mock.patch.object(course_setup, "_auto_sync_handle", None), mock.patch.object(
+            course_setup, "find_repo_root", return_value=Path("/repo")
+        ), mock.patch.object(course_setup, "SyncDaemon", FakeDaemon):
+            handle = course_setup._start_auto_sync(self._env())
+            self.assertIsInstance(handle, FakeDaemon)
+            self.assertTrue(handle.started)
+
+    def test_start_auto_sync_uses_exporter_on_colab(self):
+        with mock.patch.object(course_setup, "_auto_sync_handle", None), mock.patch.object(
+            course_setup, "find_repo_root", return_value=None
+        ):
+            handle = course_setup._start_auto_sync(self._env(in_colab=True, iscolab=True))
+            self.assertIsInstance(handle, course_setup.ColabExporter)
+
+    def test_start_auto_sync_noop_when_no_repo_off_colab(self):
+        with mock.patch.object(course_setup, "_auto_sync_handle", None), mock.patch.object(
+            course_setup, "find_repo_root", return_value=None
+        ):
+            self.assertIsNone(course_setup._start_auto_sync(self._env()))
+
+    def test_start_auto_sync_is_idempotent(self):
+        sentinel = object()
+        with mock.patch.object(course_setup, "_auto_sync_handle", sentinel), mock.patch.object(
+            course_setup, "find_repo_root"
+        ) as find:
+            self.assertIs(course_setup._start_auto_sync(self._env()), sentinel)
+            find.assert_not_called()
+
+    def test_lock_refused_when_held_by_another_live_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".git").mkdir()
+            course_setup._sync_lock_path(root).write_text(str(os.getppid()))  # a live process
+            self.assertIsNone(course_setup._acquire_sync_lock(root))
+
+    def test_lock_refused_when_already_held_by_this_process(self):
+        # A second acquire in the SAME process (e.g. a stray run_sync next to the init daemon)
+        # must back off, not reclaim its own live lock and let a later release delete it twice.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".git").mkdir()
+            first = course_setup._acquire_sync_lock(root)
+            self.assertIsNotNone(first)
+            self.assertIsNone(course_setup._acquire_sync_lock(root))
+
+    def test_lock_reclaimed_when_holder_is_dead(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".git").mkdir()
+            lock = course_setup._sync_lock_path(root)
+            lock.write_text("999999")  # a pid that is essentially never alive
+            self.assertIsNotNone(course_setup._acquire_sync_lock(root))
+            self.assertEqual(lock.read_text().strip(), str(os.getpid()))
+
+    def test_acquire_then_release_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".git").mkdir()
+            acquired = course_setup._acquire_sync_lock(root)
+            self.assertTrue(course_setup._sync_lock_path(root).exists())
+            course_setup._release_sync_lock(acquired)
+            self.assertFalse(course_setup._sync_lock_path(root).exists())
+
+    def test_run_sync_once_runs_one_pass(self):
+        with mock.patch.object(
+            course_setup, "find_repo_root", return_value=Path("/repo")
+        ), mock.patch.object(course_setup, "pull_notebooks") as pull, mock.patch.object(
+            course_setup, "mirror_notebooks"
+        ) as mirror, mock.patch.object(course_setup, "snapshot") as snap:
+            course_setup.run_sync(once=True)
+            pull.assert_called_once()
+            mirror.assert_called_once()
+            snap.assert_called_once()
+
+    def test_run_sync_noop_without_repo(self):
+        with mock.patch.object(course_setup, "find_repo_root", return_value=None):
+            course_setup.run_sync(once=True)  # must not raise
 
 
 class AutoSaverDedupTests(unittest.TestCase):

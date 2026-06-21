@@ -1,9 +1,12 @@
 # fastai-course-setup
 
-A tiny, dependency-free setup helper for my fast.ai course notebooks. It does the
-boilerplate every notebook needs - pick the best GPU, detect Colab/Kaggle/local, install
-the lesson's packages, and (on Colab) mount Google Drive - so the notebooks do not each
-repeat it.
+A tiny setup helper for my fast.ai course notebooks. It does the boilerplate every notebook
+needs - pick the best GPU, detect Colab/Kaggle/local, install the lesson's packages, and (on
+Colab) mount Google Drive - so the notebooks do not each repeat it.
+
+The core setup imports only the standard library. The optional notebook round-trip (keeping
+notebook files in sync between Colab and your Mac, with merges) uses `nbformat` and `nbdime`;
+both are imported lazily, so the module still loads fine where they are absent.
 
 ## How notebooks use it
 
@@ -58,9 +61,29 @@ package is installed.
 
 ## API
 
-- `init(packages=("fastai",), setup_book=False, competition=None, mount_drive=True, wide_print=False, internet_check=False)`
+- `init(packages=("fastai",), setup_book=False, competition=None, mount_drive=True, wide_print=False, internet_check=False, autosave=True, auto_sync=True, lesson=None)`
 - `detect_env()`, `ensure_packages(packages)`, `mount_colab_drive()`, `select_device()`,
   `download_competition(name)`, `set_wide_print()`, `check_internet()`
+
+When `auto_sync` is on (the default), `init` keeps the notebook *file* flowing too: on a
+machine with a git repo (your Mac) a background daemon pulls Colab edits home, mirrors
+notebooks to Drive, and commits + pushes on a timer; on Colab it exports the live notebook to
+Drive so the Mac daemon can complete the round-trip. A per-repo lock keeps a terminal
+`bin/sync` from double-committing alongside the in-kernel daemon.
+
+## Command-line persistence helpers
+
+```
+python course_setup.py snapshot --auto   # commit + push notebooks as they change
+python course_setup.py mirror --auto     # copy notebooks out to Drive
+python course_setup.py pull --auto       # bring Colab edits back, merging with nbdime
+python course_setup.py sync --auto       # pull + mirror + snapshot in one loop
+python course_setup.py resolve <path>    # accept a hand-resolved notebook after a conflict
+python course_setup.py restore <lesson>  # restore a lesson's artifacts from Drive
+```
+
+The `pull`/`sync`/`resolve` notebook round-trip needs `nbformat` and `nbdime` installed
+(`pip install nbdime`).
 
 ## Tests
 
@@ -68,4 +91,5 @@ package is installed.
 python -m unittest test_course_setup
 ```
 
-Standard library only - no torch or fastai needed to run the tests.
+The core setup tests use the standard library only - no torch or fastai needed. The notebook
+round-trip tests (pull, merge, export) additionally need `nbformat` and `nbdime` installed.

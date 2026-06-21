@@ -20,6 +20,7 @@ Design notes worth knowing as you read this:
   the notebook.
 """
 
+import atexit
 import glob
 import hashlib
 import importlib.util
@@ -30,6 +31,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 import zipfile
 from dataclasses import dataclass
@@ -67,6 +69,9 @@ class SetupContext:
     # The base Google Drive folder where artifacts are stored, or None if Drive is not
     # available (for example on a plain local machine).
     drive_dir: Optional[Path] = None
+    # The auto-sync handle: a SyncDaemon on a machine with a git repo, a ColabExporter on
+    # Colab, or None when auto-sync is off or has nothing to do.
+    sync: Optional[object] = None
 
 
 def detect_env() -> Environment:
@@ -793,16 +798,28 @@ def _snapshot_pathspecs():
     return ["*.ipynb", "*artifact-manifest.json"]
 
 
-def _commit_once(repo_root: Path, message_prefix: str, quiet_when_clean: bool = False) -> bool:
-    """Stage notebooks + manifests and commit if anything changed. Returns True if so."""
+def _commit_once(repo_root: Path, message_prefix: str, quiet_when_clean: bool = False,
+                 push: bool = True) -> bool:
+    """Stage notebooks + manifests, commit if anything changed, and push. Returns True if so.
+
+    When ``push`` is True (the default) a successful commit is followed by a best-effort
+    ``git push`` so the work lands on the remote, not just in the local repo. The push can
+    fail for reasons that have nothing to do with the commit (offline, no upstream, auth), so
+    it never changes the return value or raises - see ``_push_to_remote``.
+    """
     root = str(repo_root)
     for spec in _snapshot_pathspecs():
         # Add each pathspec on its own. A spec that matches nothing (for example, no
         # manifests have been created yet) makes ``git add`` print a harmless "did not
         # match" and exit non-zero; combining specs into one call would let that abort the
         # whole add, so we keep them separate and swallow that stderr.
+        add_args = ["git", "-C", root, "add", "--", spec]
+        if spec == "*.ipynb":
+            # Never commit the scratch files the round-trip writes for unresolved merge
+            # conflicts; they are local aids, not real notebooks.
+            add_args.append(f":(exclude)*{NOTEBOOK_CONFLICT_SUFFIX}")
         subprocess.run(
-            ["git", "-C", root, "add", "--", spec],
+            add_args,
             check=False,
             stderr=subprocess.DEVNULL,
         )
@@ -815,28 +832,55 @@ def _commit_once(repo_root: Path, message_prefix: str, quiet_when_clean: bool = 
     message = f"{message_prefix}: {_utc_now_iso()}"
     subprocess.run(["git", "-C", root, "commit", "-m", message], check=False)
     _persist_log(f"snapshot committed: {message}")
+    if push:
+        _push_to_remote(repo_root)
     return True
 
 
+def _push_to_remote(repo_root: Path) -> bool:
+    """Best-effort ``git push`` of the current branch. Returns True only if the push landed.
+
+    A snapshot is only useful off your laptop once it reaches the remote, so we push right
+    after committing. But a push can fail for reasons unrelated to your work - no network, no
+    configured upstream, an auth prompt - and none of that should interrupt a notebook run or
+    lose the commit (which is already safe locally). So every failure is logged and swallowed.
+    """
+    root = str(repo_root)
+    result = subprocess.run(
+        ["git", "-C", root, "push"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        _persist_log("snapshot pushed to remote")
+        return True
+    detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
+    _persist_log(f"snapshot push skipped (commit is saved locally): {detail}")
+    return False
+
+
 def snapshot(repo_root=None, once: bool = True, interval: float = 5.0,
-             message_prefix: str = "snapshot") -> bool:
-    """Commit notebooks + manifests to git. Returns True if a commit was made.
+             message_prefix: str = "snapshot", push: bool = True) -> bool:
+    """Commit notebooks + manifests to git and push. Returns True if a commit was made.
 
     Runs only where a git repo exists (your own machine); on Colab there is no repo, so
     this is a logged no-op. With ``once=False`` it polls and commits whenever files
     change, until interrupted - that is what ``bin/snapshot --auto`` runs. Running
     ``--once`` is independent: it commits and exits without touching any ``--auto`` loop.
+
+    Each commit is followed by a best-effort ``git push`` so the remote stays current; pass
+    ``push=False`` to commit without pushing (a failed push never loses the local commit).
     """
     root = find_repo_root(repo_root)
     if root is None:
         _persist_log("snapshot skipped: no git repository here (expected on Colab)")
         return False
     if once:
-        return _commit_once(root, message_prefix)
+        return _commit_once(root, message_prefix, push=push)
     _persist_log("snapshot --auto watching for changes; press Ctrl+C to stop")
     try:
         while True:
-            _commit_once(root, message_prefix, quiet_when_clean=True)
+            _commit_once(root, message_prefix, quiet_when_clean=True, push=push)
             time.sleep(interval)
     except KeyboardInterrupt:
         _persist_log("snapshot --auto stopped")
@@ -868,7 +912,7 @@ def _notebook_paths(repo_root: Path):
             if name not in AUTOSAVE_IGNORE_DIRS and not name.startswith(".")
         ]
         for filename in filenames:
-            if filename.endswith(".ipynb"):
+            if filename.endswith(".ipynb") and not filename.endswith(NOTEBOOK_CONFLICT_SUFFIX):
                 absolute = Path(dirpath) / filename
                 yield absolute, absolute.relative_to(repo_root)
 
@@ -899,6 +943,7 @@ def _mirror_once(repo_root: Path, dest_base: Path, source_mtimes: Optional[dict]
                 copied += 1
         if source_mtimes is not None:
             source_mtimes[str(absolute)] = mtime
+    _write_path_index(repo_root, dest_base)
     return copied
 
 
@@ -999,10 +1044,630 @@ def restore(lesson: str, dest_root=None) -> int:
     return restored
 
 
+# ---------------------------------------------------------------------------
+# Notebook round-trip: bring Colab edits home, with a notebook-aware 3-way merge
+# ---------------------------------------------------------------------------
+#
+# ``mirror`` pushes the Mac's notebooks out to Drive. ``pull_notebooks`` closes the loop: a
+# notebook a Colab session exported to Drive is reconciled back into the repo. When only one
+# side changed since they last agreed, the newer content simply wins. When BOTH changed, we do
+# a notebook-aware 3-way merge with nbdime, using the last-synced copy (kept on Drive under
+# ``notebooks/.sync-base``) as the common ancestor. Clean merges apply automatically; genuine
+# conflicts are written to a ``<name>.merge-conflict.ipynb`` scratch file and left for you to
+# resolve by hand, with both original sides preserved and the base untouched.
+
+NOTEBOOK_CONFLICT_SUFFIX = ".merge-conflict.ipynb"
+SYNC_BASE_DIRNAME = ".sync-base"
+
+
+def _require_notebook_tools():
+    """Import nbformat + nbdime, or return (None, None) with a logged note if unavailable.
+
+    Both are imported lazily so the module loads anywhere; the round-trip only needs them on
+    the Mac. nbformat ships with Jupyter; nbdime is the one extra dependency this adds.
+    """
+    try:
+        import nbformat
+        import nbdime
+        return nbformat, nbdime
+    except Exception as error:
+        _persist_log(f"notebook merge unavailable (need nbformat + nbdime): {error!r}")
+        return None, None
+
+
+def _read_notebook_node(path: Path):
+    """Parse a notebook file into an nbformat node, or None if it cannot be read."""
+    nbformat, _ = _require_notebook_tools()
+    if nbformat is None:
+        return None
+    try:
+        return nbformat.read(str(path), as_version=4)
+    except Exception as error:
+        _persist_log(f"could not read notebook {path}: {error!r}")
+        return None
+
+
+def _notebook_fingerprint(path: Path) -> Optional[str]:
+    """A normalized string of a notebook's content for change detection, or None.
+
+    Two files with the same cells but trivially different on-disk formatting (key order, a
+    trailing newline) normalize to the same string, so a plain re-save is not mistaken for an
+    edit. Returns None when the file is missing or unreadable.
+    """
+    if not path.exists():
+        return None
+    nbformat, _ = _require_notebook_tools()
+    if nbformat is None:
+        return None
+    node = _read_notebook_node(path)
+    if node is None:
+        return None
+    try:
+        return nbformat.writes(node)
+    except Exception:
+        return None
+
+
+def _write_notebook_node(node, path: Path) -> None:
+    """Write an nbformat node to ``path``, creating parent folders as needed."""
+    nbformat, _ = _require_notebook_tools()
+    if nbformat is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    nbformat.write(node, str(path))
+
+
+def _copy_notebook(source: Path, dest: Path) -> None:
+    """Copy a notebook file verbatim, creating parent folders as needed."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, dest)
+
+
+def _sync_base_path(notebooks_dir: Path, relative: Path) -> Path:
+    """Where the last-agreed copy of a notebook lives on Drive (the merge ancestor)."""
+    return notebooks_dir / SYNC_BASE_DIRNAME / relative
+
+
+def _conflict_scratch_path(mac_path: Path) -> Path:
+    """The local ``<name>.merge-conflict.ipynb`` scratch file for a notebook."""
+    return mac_path.parent / (mac_path.stem + NOTEBOOK_CONFLICT_SUFFIX)
+
+
+def _drive_notebook_relpaths(notebooks_dir: Path):
+    """Relative paths of real notebooks under ``<drive>/notebooks`` (no base, no scratch)."""
+    results = []
+    if not notebooks_dir.exists():
+        return results
+    for dirpath, dirnames, filenames in os.walk(notebooks_dir):
+        dirnames[:] = [d for d in dirnames if d != SYNC_BASE_DIRNAME and not d.startswith(".")]
+        for filename in filenames:
+            if filename.endswith(".ipynb") and not filename.endswith(NOTEBOOK_CONFLICT_SUFFIX):
+                absolute = Path(dirpath) / filename
+                results.append(absolute.relative_to(notebooks_dir))
+    return results
+
+
+def pull_notebooks(repo_root=None, once: bool = True, interval: float = 5.0) -> int:
+    """Reconcile notebooks between the Mac repo and Drive, merging when both sides changed.
+
+    Returns the number of notebooks whose Mac copy was created or updated on a single pass, so
+    a caller knows whether a snapshot is worth taking. A logged no-op where there is no repo
+    (Colab) or no Drive. With ``once=False`` it polls until interrupted, like the snapshot and
+    mirror watchers.
+    """
+    root = find_repo_root(repo_root)
+    if root is None:
+        _persist_log("pull skipped: no git repository here (expected on Colab)")
+        return 0
+    drive = drive_root()
+    if drive is None:
+        _persist_log("pull skipped: no Drive available")
+        return 0
+    if _require_notebook_tools()[1] is None:
+        return 0
+    notebooks_dir = drive / "notebooks"
+    if once:
+        changed = _pull_once(root, notebooks_dir)
+        _persist_log(f"pull: updated {changed} notebook(s) from Drive")
+        return changed
+    _persist_log("pull --auto watching Drive notebooks; press Ctrl+C to stop")
+    try:
+        while True:
+            _pull_once(root, notebooks_dir)
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        _persist_log("pull --auto stopped")
+    return 0
+
+
+def _pull_once(repo_root: Path, notebooks_dir: Path) -> int:
+    """One reconciliation pass over the union of notebooks on the Mac and on Drive."""
+    _write_path_index(repo_root, notebooks_dir)
+    relpaths = {relative for _, relative in _notebook_paths(repo_root)}
+    relpaths.update(_drive_notebook_relpaths(notebooks_dir))
+    changed = 0
+    for relative in sorted(relpaths, key=str):
+        if _sync_one_notebook(repo_root, notebooks_dir, relative):
+            changed += 1
+    return changed
+
+
+def _sync_one_notebook(repo_root: Path, notebooks_dir: Path, relative: Path) -> bool:
+    """Reconcile one notebook across Mac, Drive, and the stored base.
+
+    Returns True only when the Mac copy was created or changed - the signal that a snapshot is
+    worth taking.
+    """
+    mac_path = repo_root / relative
+    drive_path = notebooks_dir / relative
+    base_path = _sync_base_path(notebooks_dir, relative)
+
+    mac_fingerprint = _notebook_fingerprint(mac_path)
+    drive_fingerprint = _notebook_fingerprint(drive_path)
+    base_fingerprint = _notebook_fingerprint(base_path)
+
+    # Crucial safety check: a file that is present on disk but momentarily unreadable (an editor
+    # is mid-save, or a Drive sync landed a partial file) must NOT be treated as absent. If we
+    # did, the "exists on only one side" branches below would happily copy the other side over
+    # it and destroy a real edit. So if either live copy exists but will not parse, skip this
+    # notebook for now; a later pass will pick it up once the write has settled.
+    if (mac_path.exists() and mac_fingerprint is None) or (
+        drive_path.exists() and drive_fingerprint is None
+    ):
+        _persist_log(f"pull: skipping '{relative}' this pass (a copy is unreadable right now)")
+        return False
+
+    mac_exists = mac_fingerprint is not None
+    drive_exists = drive_fingerprint is not None
+
+    # A new local notebook not yet on Drive: seed both Drive and the base from the Mac.
+    if mac_exists and not drive_exists:
+        _copy_notebook(mac_path, drive_path)
+        _copy_notebook(mac_path, base_path)
+        return False
+    # A new notebook arrived from Colab: bring it down and seed the base.
+    if drive_exists and not mac_exists:
+        _copy_notebook(drive_path, mac_path)
+        _copy_notebook(drive_path, base_path)
+        return True
+    if not mac_exists and not drive_exists:
+        return False
+
+    mac_changed = base_fingerprint is None or mac_fingerprint != base_fingerprint
+    drive_changed = base_fingerprint is None or drive_fingerprint != base_fingerprint
+
+    if not mac_changed and not drive_changed:
+        return False
+    if mac_changed and not drive_changed:
+        _copy_notebook(mac_path, drive_path)
+        _copy_notebook(mac_path, base_path)
+        return False
+    if drive_changed and not mac_changed:
+        _copy_notebook(drive_path, mac_path)
+        _copy_notebook(drive_path, base_path)
+        return True
+    return _merge_notebook(mac_path, drive_path, base_path)
+
+
+def _merge_notebook(mac_path: Path, drive_path: Path, base_path: Path) -> bool:
+    """3-way merge a notebook that changed on both sides. Returns True if the Mac copy changed.
+
+    A clean merge is written to all three locations (Mac, Drive, base) so the two sides are
+    back in agreement. A genuine conflict overwrites nothing: it leaves both sides in place,
+    keeps the base unchanged so the conflict is re-detected until resolved, and drops a
+    ``<name>.merge-conflict.ipynb`` scratch file holding nbdime's best-effort merge.
+    """
+    nbformat, nbdime = _require_notebook_tools()
+    if nbdime is None:
+        return False
+    base = _read_notebook_node(base_path)
+    mac = _read_notebook_node(mac_path)
+    drive = _read_notebook_node(drive_path)
+    conflict_path = _conflict_scratch_path(mac_path)
+
+    # Without a readable common ancestor we cannot do a real 3-way merge, so we must not pick
+    # one side over the other. Treat it as a conflict and leave both in place.
+    if base is None or mac is None or drive is None:
+        _persist_log(
+            f"pull: cannot merge '{mac_path.name}' (missing base/local/remote); left both "
+            f"sides in place. Colab's copy is at {drive_path}."
+        )
+        return False
+
+    merged, decisions = nbdime.merge_notebooks(base, mac, drive)
+    conflicts = [decision for decision in decisions if decision.get("conflict")]
+    if not conflicts:
+        _write_notebook_node(merged, mac_path)
+        _write_notebook_node(merged, drive_path)
+        _write_notebook_node(merged, base_path)
+        if conflict_path.exists():
+            conflict_path.unlink()
+        _persist_log(f"pull: auto-merged '{mac_path.name}' (no conflicts)")
+        return True
+
+    _write_notebook_node(merged, conflict_path)
+    _persist_log(
+        f"pull: CONFLICT merging '{mac_path.name}'. Your Mac copy is unchanged; Colab's copy "
+        f"is at {drive_path}; a merge attempt is at {conflict_path.name}. Resolve it, save "
+        f"over {mac_path.name}, then run `bin/sync` (or course_setup resolve)."
+    )
+    return False
+
+
+def resolve_conflict(notebook_path, repo_root=None) -> bool:
+    """Accept a hand-resolved notebook as the new truth: update Drive + base, drop the scratch.
+
+    After you fix a conflicted notebook (editing the real ``.ipynb``), call this to make the
+    Mac version authoritative again. It copies your resolved notebook to Drive, advances the
+    merge base to match, and deletes the ``<name>.merge-conflict.ipynb`` scratch file. Returns
+    True on success.
+    """
+    root = find_repo_root(repo_root)
+    if root is None:
+        _persist_log("resolve skipped: no git repository here")
+        return False
+    drive = drive_root()
+    if drive is None:
+        _persist_log("resolve skipped: no Drive available")
+        return False
+    mac_path = Path(notebook_path)
+    if not mac_path.is_absolute():
+        mac_path = root / mac_path
+    if not mac_path.exists():
+        _persist_log(f"resolve: notebook not found: {mac_path}")
+        return False
+    notebooks_dir = drive / "notebooks"
+    relative = mac_path.relative_to(root)
+    _copy_notebook(mac_path, notebooks_dir / relative)
+    _copy_notebook(mac_path, _sync_base_path(notebooks_dir, relative))
+    conflict_path = _conflict_scratch_path(mac_path)
+    if conflict_path.exists():
+        conflict_path.unlink()
+    _persist_log(f"resolve: '{mac_path.name}' is now the agreed version on Mac and Drive")
+    return True
+
+
+PATH_INDEX_FILENAME = ".path-index.json"
+# Landing folder for notebooks exported from Colab that the Mac has never seen (so they are not
+# in the path index). They are brought into the repo here, for you to move to their real home.
+COLAB_ORIGIN_DIRNAME = "_from-colab"
+
+
+def _path_index_file(notebooks_dir: Path) -> Path:
+    return notebooks_dir / PATH_INDEX_FILENAME
+
+
+def _write_path_index(repo_root: Path, notebooks_dir: Path) -> None:
+    """Record basename -> [repo-relative paths] on Drive so a Colab export can place itself.
+
+    The Colab kernel knows only a notebook's filename, not where it lives in the repo. The Mac
+    does, so each mirror/pull pass writes this small index to Drive. Export reads it to turn
+    'pill-or-not.ipynb' back into 'homework/lesson-1/side-quest/pill-or-not.ipynb'.
+    """
+    index: dict = {}
+    for _, relative in _notebook_paths(repo_root):
+        index.setdefault(Path(relative).name, []).append(str(relative))
+    try:
+        notebooks_dir.mkdir(parents=True, exist_ok=True)
+        _path_index_file(notebooks_dir).write_text(json.dumps(index, indent=2, sort_keys=True))
+    except Exception as error:
+        _persist_log(f"could not write notebook path index: {error!r}")
+
+
+def _read_path_index(notebooks_dir: Path) -> dict:
+    path = _path_index_file(notebooks_dir)
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+
+def _resolve_export_relpath(notebooks_dir: Path, basename: str) -> Optional[str]:
+    """The unique repo-relative path for a notebook basename, or None if not safely resolvable.
+
+    Returning None on a missing or ambiguous name is deliberate: it is safer to skip the export
+    and tell the user than to drop a notebook at the wrong place in the tree.
+    """
+    matches = _read_path_index(notebooks_dir).get(basename, [])
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def export_notebook_to_drive() -> bool:
+    """Best-effort: write the live Colab notebook's JSON to Drive. Returns True on success.
+
+    The Colab kernel cannot normally see its own ``.ipynb`` file, but Colab exposes the live
+    document through an internal message channel. We ask for it and write it to
+    ``<drive>/notebooks/<repo path>``, where the Mac-side ``pull`` reconciles it. This relies on
+    Colab internals that can change without notice, so every failure is logged loudly and
+    swallowed - it must never break a user's notebook run, and it never guesses a path it cannot
+    confirm (which would misplace the file).
+    """
+    drive = drive_root()
+    if drive is None:
+        _persist_log("export skipped: no Drive available")
+        return False
+    try:
+        from google.colab import _message
+    except Exception:
+        _persist_log("export skipped: not running on Colab (no google.colab._message)")
+        return False
+    try:
+        reply = _message.blocking_request("get_ipynb", timeout_sec=30)
+        notebook_json = reply["ipynb"]
+    except Exception as error:
+        _persist_log(
+            "export FAILED: could not read the live notebook from Colab "
+            f"({error!r}). Nothing is lost - save or download the notebook by hand."
+        )
+        return False
+    notebooks_dir = drive / "notebooks"
+    raw_name = current_notebook()
+    basename = Path(raw_name).name if raw_name else None
+    if not basename:
+        _persist_log("export FAILED: could not determine the notebook filename on Colab.")
+        return False
+    relative = _resolve_export_relpath(notebooks_dir, basename)
+    if relative is None:
+        # Not in the Mac's path index: the notebook was probably created on Colab (the Mac has
+        # never seen it) or its name is ambiguous. Rather than guess a path and misplace it, or
+        # drop the work, land it in a clearly-named folder; the Mac-side pull brings it into the
+        # repo there, and you can move it to its real home.
+        relative = str(Path(COLAB_ORIGIN_DIRNAME) / basename)
+        _persist_log(
+            f"export: '{basename}' is not in the Drive path index; writing it under "
+            f"'{COLAB_ORIGIN_DIRNAME}/' so it is not lost. Move it to its real path on the Mac."
+        )
+    nbformat, _ = _require_notebook_tools()
+    if nbformat is None:
+        return False
+    try:
+        node = nbformat.reads(json.dumps(notebook_json), as_version=4)
+        _write_notebook_node(node, notebooks_dir / relative)
+    except Exception as error:
+        _persist_log(f"export FAILED: could not write notebook to Drive ({error!r})")
+        return False
+    _persist_log(f"export: wrote live notebook to {notebooks_dir / relative}")
+    return True
+
+
 def _default_lesson() -> str:
     """Tag to use when ``init`` is called with autosave on but no explicit lesson name."""
     name = current_notebook()
     return os.path.splitext(name)[0] if name else "lesson"
+
+
+# ---------------------------------------------------------------------------
+# Auto-sync: keep work flowing between Mac, Drive, and git without manual steps
+# ---------------------------------------------------------------------------
+#
+# ``init(auto_sync=True)`` wires this up. On a machine with a git repo (your Mac) a background
+# ``SyncDaemon`` runs the full loop on a timer: pull Colab edits home, mirror notebooks to
+# Drive, then commit and push. On Colab there is no repo, so instead a ``ColabExporter`` pushes
+# the live notebook to Drive as you run cells, and the Mac's daemon completes the round-trip.
+# Only one handle is ever started per kernel.
+
+_auto_sync_handle = None
+
+
+def _sync_lock_path(repo_root: Path) -> Path:
+    """The lock file marking 'a syncer is already running for this repo'."""
+    return Path(repo_root) / ".git" / "course-setup-sync.lock"
+
+
+def _process_alive(pid: int) -> bool:
+    """True if a process with this pid currently exists (best-effort, cross-platform-ish)."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # it exists, just owned by someone else
+    except OSError:
+        return False
+    return True
+
+
+def _acquire_sync_lock(repo_root: Path) -> Optional[Path]:
+    """Take the repo's sync lock, or return None if a live syncer already holds it.
+
+    This is what lets the in-kernel daemon and a terminal ``bin/sync --auto`` coexist: whoever
+    starts first wins, and the other backs off instead of double-committing. A lock left behind
+    by a dead process (stale pid) is reclaimed.
+    """
+    lock_path = _sync_lock_path(repo_root)
+    if not lock_path.parent.exists():
+        return lock_path  # no .git dir to lock in; nothing else could be running either
+    try:
+        handle = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(handle, str(os.getpid()).encode())
+        os.close(handle)
+        return lock_path
+    except FileExistsError:
+        try:
+            holder = int((lock_path.read_text().strip() or "0"))
+        except Exception:
+            holder = 0
+        # A lock held by ANY live process - including this one - means a syncer is already
+        # active, so back off. Only a lock left by a dead process (stale pid) is reclaimed.
+        if holder and _process_alive(holder):
+            return None
+        try:
+            lock_path.write_text(str(os.getpid()))
+            return lock_path
+        except Exception:
+            return None
+    except Exception:
+        # If locking itself misbehaves, do not block syncing - just run unlocked.
+        return lock_path
+
+
+def _release_sync_lock(lock_path: Optional[Path]) -> None:
+    """Delete a sync lock if we still own it."""
+    if lock_path is None:
+        return
+    try:
+        if lock_path.exists() and lock_path.read_text().strip() == str(os.getpid()):
+            lock_path.unlink()
+    except Exception:
+        pass
+
+
+class SyncDaemon:
+    """A background timer that reconciles notebooks and commits, where a git repo exists.
+
+    Each pass runs pull -> mirror -> snapshot in order (never concurrently), so the git and
+    file operations do not race each other. The worker is a daemon thread, so it never blocks
+    the notebook process from exiting, and any single failing pass is logged and skipped rather
+    than killing the loop.
+    """
+
+    def __init__(self, repo_root, interval: float = 5.0):
+        self.repo_root = Path(repo_root)
+        self.interval = interval
+        self._stop = threading.Event()
+        self._thread = None
+        self._lock_path = None
+
+    def _actions(self):
+        return (
+            ("pull", lambda: pull_notebooks(repo_root=self.repo_root, once=True)),
+            ("mirror", lambda: mirror_notebooks(repo_root=self.repo_root, once=True)),
+            ("snapshot", lambda: snapshot(repo_root=self.repo_root, once=True)),
+        )
+
+    def run_once(self) -> None:
+        """Run one pull -> mirror -> snapshot pass, isolating each step's failures."""
+        for label, action in self._actions():
+            try:
+                action()
+            except Exception as error:
+                _persist_log(f"auto-sync {label} pass failed: {error!r}")
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self.run_once()
+            self._stop.wait(self.interval)
+
+    def start(self) -> "SyncDaemon":
+        self._lock_path = _acquire_sync_lock(self.repo_root)
+        if self._lock_path is None:
+            _persist_log(
+                "auto-sync: another syncer is already running for this repo; not starting a second"
+            )
+            return self
+        self._thread = threading.Thread(target=self._run, name="course-setup-sync", daemon=True)
+        self._thread.start()
+        # The worker is a daemon thread, so it is killed abruptly at interpreter exit without
+        # running its own cleanup. Release the lock via atexit so a clean kernel shutdown frees
+        # it promptly instead of leaving a stale lock for the next run to reclaim.
+        atexit.register(_release_sync_lock, self._lock_path)
+        _persist_log("auto-sync: background snapshot/mirror/pull daemon started")
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        _release_sync_lock(self._lock_path)
+        self._lock_path = None
+
+
+class ColabExporter:
+    """On Colab, push the live notebook to Drive after cells run (throttled).
+
+    There is no git repo on Colab, so the round-trip's Colab half is simply getting the edited
+    notebook file onto Drive; the Mac daemon does the rest. We hang this off IPython's
+    ``post_run_cell`` event like autosave does, but throttle it so we are not serializing the
+    whole notebook on every single cell.
+    """
+
+    def __init__(self, min_interval: float = 20.0):
+        self.min_interval = min_interval
+        self._last_export = 0.0
+        self._registered = False
+
+    def register(self) -> "ColabExporter":
+        ipython = _get_ipython()
+        if ipython is None:
+            _persist_log("colab export inactive (not running inside IPython/Jupyter)")
+            return self
+        ipython.events.register("post_run_cell", self._on_post_run_cell)
+        # The post-cell throttle means edits in the last seconds before a Colab runtime
+        # disconnects might never be pushed. A best-effort export at interpreter exit flushes
+        # that final state so a clean shutdown does not lose the last few minutes of work.
+        atexit.register(self._flush)
+        self._registered = True
+        _persist_log("colab export armed; the live notebook will sync to Drive as cells run")
+        return self
+
+    def _flush(self) -> None:
+        try:
+            export_notebook_to_drive()
+        except Exception as error:
+            _persist_log(f"colab export flush error: {error!r}")
+
+    def _on_post_run_cell(self, result=None) -> None:
+        now = time.monotonic()
+        if now - self._last_export < self.min_interval:
+            return
+        self._last_export = now
+        try:
+            export_notebook_to_drive()
+        except Exception as error:  # the hook must never break the user's notebook
+            _persist_log(f"colab export hook error: {error!r}")
+
+
+def _start_auto_sync(env: Environment):
+    """Start the right auto-sync half for this machine. Returns its handle, or None.
+
+    Idempotent: only one handle is created per kernel, so re-running ``init`` does not pile up
+    daemons or hooks.
+    """
+    global _auto_sync_handle
+    if _auto_sync_handle is not None:
+        return _auto_sync_handle
+    repo = find_repo_root()
+    if repo is not None:
+        _auto_sync_handle = SyncDaemon(repo).start()
+    elif env.in_colab or env.iscolab:
+        _auto_sync_handle = ColabExporter().register()
+    else:
+        _persist_log("auto-sync: nothing to do (no git repo here, not on Colab)")
+    return _auto_sync_handle
+
+
+def run_sync(repo_root=None, once: bool = True, interval: float = 5.0) -> None:
+    """Foreground pull -> mirror -> snapshot, for ``bin/sync``. A no-op without a git repo.
+
+    ``--once`` runs a single pass and exits. ``--auto`` loops until interrupted, taking the
+    repo's sync lock first so it cooperates with (rather than fights) an in-kernel daemon that
+    a running notebook may already have started.
+    """
+    root = find_repo_root(repo_root)
+    if root is None:
+        _persist_log("sync skipped: no git repository here (expected on Colab)")
+        return
+    daemon = SyncDaemon(root, interval=interval)
+    if once:
+        daemon.run_once()
+        return
+    lock_path = _acquire_sync_lock(root)
+    if lock_path is None:
+        _persist_log("sync --auto: another syncer is already running for this repo; exiting")
+        return
+    _persist_log("sync --auto: pull + mirror + snapshot on a loop; press Ctrl+C to stop")
+    try:
+        while True:
+            daemon.run_once()
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        _persist_log("sync --auto stopped")
+    finally:
+        _release_sync_lock(lock_path)
 
 
 def init(
@@ -1013,6 +1678,7 @@ def init(
     wide_print: bool = False,
     internet_check: bool = False,
     autosave: bool = True,
+    auto_sync: bool = True,
     lesson: Optional[str] = None,
 ) -> SetupContext:
     """Run the standard course setup and return a context with the results.
@@ -1029,6 +1695,12 @@ def init(
     those artifacts are filed under; if omitted it is guessed from the notebook filename.
     Autosave is lazy and harmless: it does nothing until Drive is available and a real
     artifact appears, so leaving it on in a notebook that never trains costs nothing.
+
+    When ``auto_sync`` is on (the default), the notebook file itself is kept flowing too. On a
+    machine with a git repo (your Mac) a background daemon pulls Colab edits home, mirrors
+    notebooks to Drive, and commits + pushes on a timer. On Colab, where there is no repo, the
+    live notebook is pushed to Drive as cells run so the Mac daemon can complete the loop. Pass
+    ``auto_sync=False`` to opt out (for example, if you prefer to run ``bin/sync`` by hand).
     """
     env = detect_env()
 
@@ -1052,6 +1724,7 @@ def init(
     device = select_device()
 
     saver = AutoSaver(lesson or _default_lesson()).register() if autosave else None
+    sync_handle = _start_auto_sync(env) if auto_sync else None
 
     return SetupContext(
         device=device,
@@ -1061,6 +1734,7 @@ def init(
         path=path,
         saver=saver,
         drive_dir=drive_root(),
+        sync=sync_handle,
     )
 
 
@@ -1096,6 +1770,23 @@ def _main(argv=None):
         help="base directory to restore into (defaults to the current directory)",
     )
 
+    pull_parser = sub.add_parser("pull", help="bring Colab notebook edits back from Drive")
+    pull_mode = pull_parser.add_mutually_exclusive_group()
+    pull_mode.add_argument("--auto", action="store_true", help="watch and reconcile continuously")
+    pull_mode.add_argument("--once", action="store_true", help="reconcile once and exit (default)")
+
+    resolve_parser = sub.add_parser(
+        "resolve", help="accept a hand-resolved notebook after a merge conflict"
+    )
+    resolve_parser.add_argument("notebook", help="path to the resolved .ipynb")
+
+    sync_parser = sub.add_parser(
+        "sync", help="pull + mirror + snapshot in one go (the full round-trip)"
+    )
+    sync_mode = sync_parser.add_mutually_exclusive_group()
+    sync_mode.add_argument("--auto", action="store_true", help="run the loop continuously")
+    sync_mode.add_argument("--once", action="store_true", help="run one pass and exit (default)")
+
     args = parser.parse_args(argv)
     if args.command == "snapshot":
         snapshot(once=not args.auto)
@@ -1103,6 +1794,12 @@ def _main(argv=None):
         mirror_notebooks(once=not args.auto)
     elif args.command == "restore":
         restore(args.lesson, dest_root=args.dest)
+    elif args.command == "pull":
+        pull_notebooks(once=not args.auto)
+    elif args.command == "resolve":
+        resolve_conflict(args.notebook)
+    elif args.command == "sync":
+        run_sync(once=not args.auto)
 
 
 if __name__ == "__main__":
